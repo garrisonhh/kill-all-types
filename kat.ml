@@ -1,20 +1,5 @@
 (* parser =================================================================== *)
 
-module AstNode = struct
-  (* TODO literals vs. idents *)
-  type t =
-  | Symbol of string
-  | Integer of int
-  | Group of t list
-
-  let rec to_string = function
-  | Symbol (s) -> s
-  | Integer (n) -> (Int.to_string n)
-  | Group (children) ->
-    let inner = String.concat " " (List.map to_string children) in
-    "(" ^ inner ^ ")"
-end
-
 module CharSet = Set.Make (Char)
 
 let ascii_range start stop =
@@ -42,7 +27,7 @@ let parse_alpha =
 
 let parse_int =
   let parse_int_aux = Parser.repeating parse_digit in
-  let convert_int ds = AstNode.Integer (int_of_string (String.concat "" ds)) in
+  let convert_int ds = Astnode.Integer (int_of_string (String.concat "" ds)) in
   let parser = Parser.map convert_int parse_int_aux in
   Parser.rename "integer" parser
 
@@ -54,7 +39,7 @@ let parse_symbol =
   in
   let parser = Parser.repeating (parse_char_list "symbolic" symbolic) in
   parser
-  |> Parser.map (fun xs -> AstNode.Symbol (String.concat "" xs))
+  |> Parser.map (fun xs -> Astnode.Symbol (String.concat "" xs))
   |> Parser.rename "symbol"
 
 let parse_group parse_expr =
@@ -62,7 +47,7 @@ let parse_group parse_expr =
   let right = Parser.(spaces *> exact ")") in
   let expr = Parser.(spaces *> parse_expr) in
   let group_parser = Parser.(rename "group" (left *> many expr <* right)) in
-  Parser.map (fun x -> AstNode.Group x) group_parser
+  Parser.map (fun x -> Astnode.Group x) group_parser
 
 (* TODO figure out why the fuck I have to jump through so many hoops to
    get this thing to work *)
@@ -76,24 +61,20 @@ let rec parse_expr_aux () =
 
 let parse_expr = parse_expr_aux ()
 
-let parse (program: string): (AstNode.t, Parser.error) result =
+let parse (program: string): (Astnode.t, Parser.error) result =
   let result = Parser.parse parse_expr program in
   result
 
 (* compilation cycle ======================================================== *)
 
-let read_file filename =
-  let chan = open_in filename in
-  really_input_string chan (in_channel_length chan)
-
 let compile filename target =
   Printf.printf "compiling file %s to %s\n" filename target;
-  let program = read_file filename in
+  let program = Util.read_file filename in
   match parse program with
   | Error ({msg; pos}) -> Printf.eprintf "error at %d: %s\n" pos msg
   | Ok (ast) ->
-    Printf.printf "successfully parsed ast:\n%s\n" (AstNode.to_string ast);
-  failwith "TODO compile ast"
+    Printf.printf "successfully parsed ast:\n%s\n" (Astnode.to_string ast);
+    Codegen.generate target ast
 
 (* cli ====================================================================== *)
 
