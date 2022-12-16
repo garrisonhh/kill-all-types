@@ -4,25 +4,29 @@ module IR = struct
     | Debug
     (* functions *)
     | SysCall of int
-    | Call of int
+    | Call
     | DefBegin of string | DefEnd
-    | LamBegin | LamEnd
+    | LamBegin | LamEnd of int (* nargs *)
     | Param of int * int (* n, total *)
     (* integral math *)
     | IAdd | ISub | IDiv | IMul | IMod
     (* values *)
     | IPush of int | LPush of string
+    (* if *)
+    | If of string (* else lbl *)
+    | Else of string * string (* else lbl, final lbl *)
+    | EndIf of string (* final lbl *)
 
     let to_string op =
       let spf = Printf.sprintf in
       match op with
       | Debug -> "debug"
       | SysCall (n) -> spf "syscall %d" n
-      | Call (nargs) -> spf "call %d" nargs
+      | Call -> "call"
       | DefBegin (name) -> spf "begin def %s" name
       | DefEnd -> "end def"
       | LamBegin -> "begin lambda"
-      | LamEnd -> "end lambda"
+      | LamEnd (nargs) -> spf "end lambda (%d args)" nargs
       | Param (n, tot) -> spf "param %d/%d" (n + 1) tot
       | IAdd -> "iadd"
       | ISub -> "isub"
@@ -31,11 +35,14 @@ module IR = struct
       | IMod -> "imod"
       | IPush (n) -> spf "ipush %d" n
       | LPush (lbl) -> spf "lpush %s" lbl
+      | If (_) -> "if"
+      | Else (_, _) -> "else"
+      | EndIf (_) -> "endif"
 end
 
 module ASM = struct
   type reg =
-    | Rax | Rbx | Rcx | Rdx
+    | Rax | Rbx | Rdx
 
   type t =
     | Comment of string
@@ -54,13 +61,16 @@ module ASM = struct
     | Call of reg
     | SysCall
     | Ret
+    | Jump of string
+    | Test of reg
+    | JumpIf of string
+    | JumpIfN of string
 
   let to_string op =
     let reg_to_string r =
       "%" ^ match r with
       | Rax -> "rax"
       | Rbx -> "rbx"
-      | Rcx -> "rcx"
       | Rdx -> "rdx"
     in
     let indent = String.make 8 ' ' in
@@ -95,20 +105,30 @@ module ASM = struct
     | Call (r)        -> fmt_op "call" @@ spf "*%s" @@ reg_to_string r
     | SysCall         -> fmt_op "syscall" ""
     | Ret             -> fmt_op "ret" ""
+    | Jump (lbl)      -> fmt_op "jmp" lbl
+    | Test (r)        -> inst "test" [r; r]
+    | JumpIf (lbl)    -> fmt_op "jnz" lbl
+    | JumpIfN (lbl)    -> fmt_op "jz" lbl
 end
 
 module Builder = struct
   module StrMap = Map.Make(String)
 
   type t = {
+    label: int;
     params: int StrMap.t;
     ir: IR.t array;
   }
 
   let init: t = {
+    label = 0;
     params = StrMap.empty;
     ir = [||];
   }
+
+  let next_label b =
+    let label = Printf.sprintf "__label%d" b.label in
+    (label, { b with label = b.label + 1 })
 
   let set_params params b =
     { b with params = params }
@@ -134,13 +154,13 @@ let compile_error msg =
   Printf.eprintf "error: %s" msg;
   exit 1
 
-let call_to (name: string) (nargs: int): IR.t array =
-  [|LPush (name); Call (nargs)|]
+let call_to (name: string): IR.t array =
+  [|LPush (name); Call|]
 
-let lower_symbol (sym: string) (nargs: int) (b: Builder.t): IR.t array =
+let lower_symbol (sym: string) (b: Builder.t): IR.t array =
   match Builder.get_param sym b with
   | Some (n) -> [|Param (n, Builder.nparams b)|]
-  | None -> call_to sym nargs
+  | None -> call_to sym
 
 let rec build_call (group: Astnode.t list) (b: Builder.t): Builder.t =
   assert (List.length group > 0);
@@ -169,8 +189,24 @@ let rec build_call (group: Astnode.t list) (b: Builder.t): Builder.t =
     |> Builder.set_params param_map
     |> Builder.append LamBegin
     |> build_values body
-    |> Builder.append LamEnd
+    |> (fun b -> Builder.append (LamEnd (Builder.nparams b)) b)
     |> Builder.drop_params
+  end
+  | Symbol ("if") -> begin
+    let (cond, ift, iff) =
+      match tail with
+      | cond :: ift :: iff :: [] -> (cond, ift, iff)
+      | _ -> assert false
+    in
+    let else_lbl, b = Builder.next_label b in
+    let final_lbl, b = Builder.next_label b in
+    b
+    |> build_value cond
+    |> Builder.append (If (else_lbl))
+    |> build_value ift
+    |> Builder.append (Else (else_lbl, final_lbl))
+    |> build_value iff
+    |> Builder.append (EndIf (final_lbl))
   end
   | Symbol (s) -> begin
     (* compile call *)
@@ -184,21 +220,21 @@ let rec build_call (group: Astnode.t list) (b: Builder.t): Builder.t =
       | "mod"     -> [|IMod|]
       | "debug"   -> [|Debug|]
       | "syscall" -> [|SysCall ((List.length tail) - 1)|]
-      | sym       -> lower_symbol sym (List.length tail) b
+      | sym       -> lower_symbol sym b
     in
-    List.fold_left (fun b node -> build_value node 0 b) b tail
+    List.fold_left (fun b node -> build_value node b) b tail
     |> Builder.append_slice slice
   end
-  | node -> build_value node (List.length tail) b
+  | node -> build_value node b
 
-and build_value (node: Astnode.t) (nargs: int) (b: Builder.t): Builder.t =
+and build_value (node: Astnode.t) (b: Builder.t): Builder.t =
   match node with
-  | Symbol (sym) -> Builder.append_slice (lower_symbol sym nargs b) b
+  | Symbol (sym) -> Builder.append_slice (lower_symbol sym b) b
   | Integer (n) -> Builder.append (IPush n) b
   | Group (xs) -> build_call xs b
 
 and build_values (nodes: Astnode.t list) (b: Builder.t): Builder.t =
-  List.fold_left (fun b node -> build_value node 0 b) b nodes
+  List.fold_left (fun b node -> build_value node b) b nodes
 
 let compile (b: Builder.t): ASM.t array =
   let compile_op (op: IR.t): ASM.t array =
@@ -219,10 +255,9 @@ let compile (b: Builder.t): ASM.t array =
         Hack ("pop", "%rdi");
       |] in
       Array.concat [(Array.sub setups (6 - n) n); [|Pop (Rax); SysCall|]]
-    | Call (nargs) -> [|
+    | Call -> [|
       Pop (Rax);
       Call (Rax);
-      DropN (nargs);
       Push (Rax);
     |]
     | DefBegin (name) -> [|Label (name)|]
@@ -231,9 +266,14 @@ let compile (b: Builder.t): ASM.t array =
       Hack ("push", "%rbp");
       Hack ("mov", "%rsp, %rbp");
     |]
-    | LamEnd -> [|
+    | LamEnd (nargs) -> [|
+      (* ret setup *)
       Pop (Rax);
       Hack ("pop", "%rbp");
+      (* delete params *)
+      Pop (Rbx);
+      DropN (nargs);
+      Push (Rbx);
     |]
     | Param (n, tot) ->
       let offset = (1 + tot - n) * 8 in
@@ -272,6 +312,16 @@ let compile (b: Builder.t): ASM.t array =
     |]
     | IPush (n) -> [|IPush (n)|]
     | LPush (s) -> [|LPush (s)|]
+    | If (else_lbl) -> [|
+      Pop (Rax);
+      Test (Rax);
+      JumpIfN (else_lbl);
+    |]
+    | Else (else_lbl, final_lbl) -> [|
+      Jump (final_lbl);
+      Label (else_lbl);
+    |]
+    | EndIf (final_lbl) -> [|Label (final_lbl)|]
   in
   let compile_op_commented op =
     Array.append [|ASM.Comment (IR.to_string op)|] @@ compile_op op
