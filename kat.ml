@@ -61,8 +61,9 @@ let rec parse_expr_aux () =
 
 let parse_expr = parse_expr_aux ()
 
-let parse (program: string): (Astnode.t, Parser.error) result =
-  let result = Parser.parse parse_expr program in
+let parse (program: string): (Astnode.t list, Parser.error) result =
+  let program_parser = Parser.(many (spaces *> parse_expr)) in
+  let result = Parser.parse program_parser program in
   result
 
 (* compilation cycle ======================================================== *)
@@ -72,9 +73,11 @@ let compile filename target =
   let program = Util.read_file filename in
   match parse program with
   | Error ({msg; pos}) -> Printf.eprintf "error at %d: %s\n" pos msg
-  | Ok (ast) ->
-    Printf.printf "successfully parsed ast:\n%s\n" (Astnode.to_string ast);
-    Codegen.generate target ast
+  | Ok (nodes) ->
+    Printf.printf
+      "successfully parsed ast:\n%s\n"
+      (String.concat "\n" (List.map Astnode.to_string nodes));
+    Codegen.generate target nodes
 
 (* cli ====================================================================== *)
 

@@ -1,6 +1,6 @@
 // kill-all-types header
 
-__kat__putchar:
+__putchar:
         push    %rbp
         mov     %rsp, %rbp
 
@@ -16,7 +16,7 @@ __kat__putchar:
         pop     %rbp
         ret
 
-__kat__print_dec:
+__print_dec:
         push    %rbp
         mov     %rsp, %rbp
         sub     $64, %rsp
@@ -24,20 +24,20 @@ __kat__print_dec:
 
         // zero is a special case
         cmp     $0, %rdi
-        jnz     __kat__print_dec_nonzero
+        jnz     __print_dec_nonzero
 
         mov     $'0', %dil
-        call    __kat__putchar
+        call    __putchar
 
-        jmp     __kat__print_dec_return
+        jmp     __print_dec_return
 
-__kat__print_dec_nonzero:
+__print_dec_nonzero:
 
         // store each decimal point in order on stack
         xor     %rcx, %rcx
         mov     %rdi, %rax
         mov     %rsp, %rdi
-__kat__print_dec_extrude_loop:
+__print_dec_extrude_loop:
         // divide by 10
         xor     %rdx, %rdx
         mov     $10, %rsi
@@ -49,35 +49,46 @@ __kat__print_dec_extrude_loop:
         add     $1, %rcx
 
         cmp     $0, %rax
-        jnz     __kat__print_dec_extrude_loop
+        jnz     __print_dec_extrude_loop
 
         // actually print the numbers
         mov     %rdi, %rax
-__kat__print_dec_print_loop:
+__print_dec_print_loop:
         sub     $1, %rax
         mov     (%rax), %dil
         add     $'0', %dil
         push    %rax
         push    %rcx
-        call    __kat__putchar
+        call    __putchar
         pop     %rcx
         pop     %rax
-        loop    __kat__print_dec_print_loop
+        loop    __print_dec_print_loop
 
-__kat__print_dec_return:
+__print_dec_return:
         mov     -8(%rbp), %rcx
         add     $64, %rsp
         pop     %rbp
         ret
 
 // debug print a u64
-__kat__debug:
+__debug:
         mov     +8(%rsp), %rdi
-        call    __kat__print_dec
+        call    __print_dec
         mov     $'\n', %rdi
-        call    __kat__putchar
+        call    __putchar
         ret
 
+// entry point: call 'main' and exit(0)
 .global _start
 _start:
-        // compiler generated from this point onwards
+        push    $-1 // stack marker for debugging
+        call    main
+        pop     %rax
+
+        mov     $60, %rax
+        mov     $0, %rdi
+        syscall
+
+// =============================================================================
+// begin generated code
+// =============================================================================

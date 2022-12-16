@@ -1,6 +1,5 @@
 (executable
-  (name kat)
-  (libraries str))
+  (name kat))
 
 ; disables 'unused var/constructor' warnings in dev mode
 (env
