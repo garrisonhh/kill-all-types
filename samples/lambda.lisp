@@ -1,6 +1,9 @@
 (def add (lambda (a b)
   (+ a b)))
 
+(def debug_pass (lambda (value)
+  (debug value)
+  value))
+
 (def main (lambda ()
-  (debug (add 3 4))
-  0))
+  (debug_pass (* 10 (debug_pass (add 3 4))))))

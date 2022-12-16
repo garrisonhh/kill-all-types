@@ -4,7 +4,7 @@ module IR = struct
     | Debug
     (* functions *)
     | SysCall of int
-    | Call
+    | Call of int
     | DefBegin of string | DefEnd
     | LamBegin | LamEnd
     | Param of int * int (* n, total *)
@@ -18,12 +18,12 @@ module IR = struct
       match op with
       | Debug -> "debug"
       | SysCall (n) -> spf "syscall %d" n
-      | Call -> "call"
-      | DefBegin (name) -> spf "begin fn %s" name
-      | DefEnd -> "end fn"
+      | Call (nargs) -> spf "call %d" nargs
+      | DefBegin (name) -> spf "begin def %s" name
+      | DefEnd -> "end def"
       | LamBegin -> "begin lambda"
       | LamEnd -> "end lambda"
-      | Param (n, tot) -> spf "param %d/%d" n tot
+      | Param (n, tot) -> spf "param %d/%d" (n + 1) tot
       | IAdd -> "iadd"
       | ISub -> "isub"
       | IMul -> "imul"
@@ -43,6 +43,7 @@ module ASM = struct
     | Label of string
     | IPush of int
     | LPush of string (* push a label as a ptr *)
+    | DropN of int
     | Zero of reg
     | Pop of reg
     | Push of reg
@@ -50,7 +51,7 @@ module ASM = struct
     | ISub of reg * reg
     | IMul of reg (* multiply reg by rax *)
     | IDiv of reg
-    | RawCall of reg
+    | Call of reg
     | SysCall
     | Ret
 
@@ -83,6 +84,7 @@ module ASM = struct
     | Label (s)       -> spf "%s:" s
     | IPush (n)       -> fmt_op "push" @@ spf "$%d" n
     | LPush (s)       -> fmt_op "push" @@ spf "$%s" s
+    | DropN (n)       -> fmt_op "add" @@ spf "$%d, %%rsp" (8 * n)
     | Zero (r)        -> inst "xor" [r; r]
     | Pop (r)         -> inst "pop"  [r]
     | Push (r)        -> inst "push" [r]
@@ -90,7 +92,7 @@ module ASM = struct
     | ISub (src, dst) -> inst "sub"  [src; dst]
     | IMul (r)        -> inst "mul"  [r]
     | IDiv (r)        -> inst "div"  [r]
-    | RawCall (r)     -> fmt_op "call" @@ spf "*%s" @@ reg_to_string r
+    | Call (r)        -> fmt_op "call" @@ spf "*%s" @@ reg_to_string r
     | SysCall         -> fmt_op "syscall" ""
     | Ret             -> fmt_op "ret" ""
 end
@@ -132,13 +134,13 @@ let compile_error msg =
   Printf.eprintf "error: %s" msg;
   exit 1
 
-let call_to (name: string): IR.t array =
-  [|LPush (name); Call|]
+let call_to (name: string) (nargs: int): IR.t array =
+  [|LPush (name); Call (nargs)|]
 
-let lower_symbol (sym: string) (b: Builder.t): IR.t array =
+let lower_symbol (sym: string) (nargs: int) (b: Builder.t): IR.t array =
   match Builder.get_param sym b with
   | Some (n) -> [|Param (n, Builder.nparams b)|]
-  | None -> call_to sym
+  | None -> call_to sym nargs
 
 let rec build_call (group: Astnode.t list) (b: Builder.t): Builder.t =
   assert (List.length group > 0);
@@ -182,21 +184,21 @@ let rec build_call (group: Astnode.t list) (b: Builder.t): Builder.t =
       | "mod"     -> [|IMod|]
       | "debug"   -> [|Debug|]
       | "syscall" -> [|SysCall ((List.length tail) - 1)|]
-      | sym       -> lower_symbol sym b
+      | sym       -> lower_symbol sym (List.length tail) b
     in
-    List.fold_left (Fun.flip build_value) b tail
-    |>  Builder.append_slice slice
+    List.fold_left (fun b node -> build_value node 0 b) b tail
+    |> Builder.append_slice slice
   end
-  | node -> build_value node b
+  | node -> build_value node (List.length tail) b
 
-and build_value (node: Astnode.t) (b: Builder.t): Builder.t =
+and build_value (node: Astnode.t) (nargs: int) (b: Builder.t): Builder.t =
   match node with
-  | Symbol (sym) -> Builder.append_slice (lower_symbol sym b) b
+  | Symbol (sym) -> Builder.append_slice (lower_symbol sym nargs b) b
   | Integer (n) -> Builder.append (IPush n) b
   | Group (xs) -> build_call xs b
 
 and build_values (nodes: Astnode.t list) (b: Builder.t): Builder.t =
-  List.fold_left (Fun.flip build_value) b nodes
+  List.fold_left (fun b node -> build_value node 0 b) b nodes
 
 let compile (b: Builder.t): ASM.t array =
   let compile_op (op: IR.t): ASM.t array =
@@ -204,7 +206,7 @@ let compile (b: Builder.t): ASM.t array =
     | Debug -> [|
       LPush ("__debug");
       Pop (Rax);
-      RawCall (Rax);
+      Call (Rax);
       Pop (Rax);
     |]
     | SysCall (n) ->
@@ -217,9 +219,10 @@ let compile (b: Builder.t): ASM.t array =
         Hack ("pop", "%rdi");
       |] in
       Array.concat [(Array.sub setups (6 - n) n); [|Pop (Rax); SysCall|]]
-    | Call -> [|
+    | Call (nargs) -> [|
       Pop (Rax);
-      RawCall (Rax);
+      Call (Rax);
+      DropN (nargs);
       Push (Rax);
     |]
     | DefBegin (name) -> [|Label (name)|]
@@ -233,8 +236,8 @@ let compile (b: Builder.t): ASM.t array =
       Hack ("pop", "%rbp");
     |]
     | Param (n, tot) ->
-      let offset = (tot - n) * 8 in
-      [|Hack ("push", Printf.sprintf "-%d(%%rsp)" offset)|]
+      let offset = (1 + tot - n) * 8 in
+      [|Hack ("push", Printf.sprintf "+%d(%%rbp)" offset)|]
     | IAdd -> [|
       Pop (Rbx);
       Pop (Rax);
