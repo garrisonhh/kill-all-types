@@ -5,8 +5,9 @@ module IR = struct
     (* functions *)
     | SysCall of int
     | Call
-    | FnBegin of string
-    | FnEnd
+    | DefBegin of string | DefEnd
+    | LamBegin | LamEnd
+    | Param of int * int (* n, total *)
     (* integral math *)
     | IAdd | ISub | IDiv | IMul | IMod
     (* values *)
@@ -18,8 +19,11 @@ module IR = struct
       | Debug -> "debug"
       | SysCall (n) -> spf "syscall %d" n
       | Call -> "call"
-      | FnBegin (name) -> spf "begin fn %s" name
-      | FnEnd -> "end fn"
+      | DefBegin (name) -> spf "begin fn %s" name
+      | DefEnd -> "end fn"
+      | LamBegin -> "begin lambda"
+      | LamEnd -> "end lambda"
+      | Param (n, tot) -> spf "param %d/%d" n tot
       | IAdd -> "iadd"
       | ISub -> "isub"
       | IMul -> "imul"
@@ -92,14 +96,36 @@ module ASM = struct
 end
 
 module Builder = struct
-  type t =
-    IR.t array
+  module StrMap = Map.Make(String)
 
-  let append (op: IR.t) (b: t): t =
-    Array.append b [|op|]
+  type t = {
+    params: int StrMap.t;
+    ir: IR.t array;
+  }
+
+  let init: t = {
+    params = StrMap.empty;
+    ir = [||];
+  }
+
+  let set_params params b =
+    { b with params = params }
+
+  let drop_params b =
+    { b with params = StrMap.empty }
+
+  let get_param name b =
+    StrMap.find_opt name b.params
+
+  let nparams b =
+    StrMap.bindings b.params
+    |> List.length
 
   let append_slice (ops: IR.t array) (b: t): t =
-    Array.append b ops
+    { b with ir = Array.append b.ir ops }
+
+  let append (op: IR.t) (b: t): t =
+    append_slice [|op|] b
 end
 
 let compile_error msg =
@@ -109,24 +135,43 @@ let compile_error msg =
 let call_to (name: string): IR.t array =
   [|LPush (name); Call|]
 
+let lower_symbol (sym: string) (b: Builder.t): IR.t array =
+  match Builder.get_param sym b with
+  | Some (n) -> [|Param (n, Builder.nparams b)|]
+  | None -> call_to sym
+
 let rec build_call (group: Astnode.t list) (b: Builder.t): Builder.t =
   assert (List.length group > 0);
   let head, tail = List.hd group, List.tl group in
   match head with
   | Symbol ("def") -> begin
-    assert (List.length tail > 1);
+    (* compile def *)
+    assert (List.length tail > 0);
     let sym, body = List.hd tail, List.tl tail in
-    let name =
-      match sym with
-      | Symbol (name) -> name
-      | _ -> compile_error "def must have a symbol as the first argument"
+    b
+    |> Builder.append (DefBegin (Astnode.sym sym))
+    |> build_values body
+    |> Builder.append DefEnd
+  end
+  | Symbol ("lambda") -> begin
+    (* compile lambda *)
+    assert (List.length tail > 0);
+    let params, body = List.hd tail, List.tl tail in
+    let param_map =
+      Astnode.group params
+      |> List.mapi (fun i sym -> (Astnode.sym sym), i)
+      |> List.to_seq
+      |> Builder.StrMap.of_seq
     in
     b
-    |> Builder.append (FnBegin (name))
+    |> Builder.set_params param_map
+    |> Builder.append LamBegin
     |> build_values body
-    |> Builder.append FnEnd
+    |> Builder.append LamEnd
+    |> Builder.drop_params
   end
   | Symbol (s) -> begin
+    (* compile call *)
     let slice: IR.t array =
       match s with
       | "do"      -> [||]
@@ -137,16 +182,16 @@ let rec build_call (group: Astnode.t list) (b: Builder.t): Builder.t =
       | "mod"     -> [|IMod|]
       | "debug"   -> [|Debug|]
       | "syscall" -> [|SysCall ((List.length tail) - 1)|]
-      | sym       -> call_to sym
+      | sym       -> lower_symbol sym b
     in
     List.fold_left (Fun.flip build_value) b tail
     |>  Builder.append_slice slice
   end
-  | _ -> compile_error "attempted to call uncallable"
+  | node -> build_value node b
 
 and build_value (node: Astnode.t) (b: Builder.t): Builder.t =
   match node with
-  | Symbol (sym) -> Builder.append_slice (call_to sym) b
+  | Symbol (sym) -> Builder.append_slice (lower_symbol sym b) b
   | Integer (n) -> Builder.append (IPush n) b
   | Group (xs) -> build_call xs b
 
@@ -177,17 +222,19 @@ let compile (b: Builder.t): ASM.t array =
       RawCall (Rax);
       Push (Rax);
     |]
-    | FnBegin (name) -> [|
-      Label (name);
+    | DefBegin (name) -> [|Label (name)|]
+    | DefEnd -> [|Ret|]
+    | LamBegin -> [|
       Hack ("push", "%rbp");
       Hack ("mov", "%rsp, %rbp");
     |]
-    | FnEnd -> [|
-      (* returns value in rax *)
+    | LamEnd -> [|
       Pop (Rax);
       Hack ("pop", "%rbp");
-      Ret;
     |]
+    | Param (n, tot) ->
+      let offset = (tot - n) * 8 in
+      [|Hack ("push", Printf.sprintf "-%d(%%rsp)" offset)|]
     | IAdd -> [|
       Pop (Rbx);
       Pop (Rax);
@@ -226,7 +273,7 @@ let compile (b: Builder.t): ASM.t array =
   let compile_op_commented op =
     Array.append [|ASM.Comment (IR.to_string op)|] @@ compile_op op
   in
-  Array.map compile_op_commented b
+  Array.map compile_op_commented b.ir
   |> Array.to_list
   |> Array.concat
 
@@ -238,7 +285,7 @@ let read_asm_file filename =
 let header = read_asm_file "templates/header.S"
 
 let generate (target: string) (nodes: Astnode.t list): unit =
-  let built = build_values nodes [||] in
+  let built = build_values nodes Builder.init in
   let asm = Array.map ASM.to_string @@ compile built in
   let source =
     Array.concat [header; asm]
