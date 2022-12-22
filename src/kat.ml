@@ -62,7 +62,6 @@ let parse (program : string) : (Astnode.t list, Parser.error) result =
 (* compilation cycle ======================================================== *)
 
 let compile filename target =
-  Printf.printf "compiling file %s to %s\n" filename target;
   let program = Util.read_file filename in
   match parse program with
   | Error { msg; _ } -> Printf.eprintf "error: %s\n" msg
@@ -74,12 +73,16 @@ let compile filename target =
 (* cli ====================================================================== *)
 
 let () =
-  let usage = "kat [OPTIONS] INPUT" in
-  let file = ref "" in
+  let usage = "kat [options] <file>" in
+  let file = ref None in
   let target = ref "katout.S" in
-  let anon input_file = file := input_file in
+  let anon input_file = file := Some input_file in
   let specs =
     [ ("-o", Arg.Set_string target, "set target (default katout.S)") ]
   in
   Arg.parse specs anon usage;
-  compile !file !target
+  match !file with
+  | Some file -> compile file !target
+  | None ->
+      Arg.usage specs usage;
+      exit 1
