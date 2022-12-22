@@ -1,5 +1,11 @@
 (* parser =================================================================== *)
 
+module Parser = Parser.Make (struct
+  type t = char
+  let equal = Char.equal
+  let to_string = Char.escaped
+end)
+
 module CharSet = Set.Make (Char)
 
 let ascii_range start stop =
@@ -9,61 +15,54 @@ let ascii_range start stop =
   let chr x = Char.chr (x + start_code) in
   List.init (stop_code + 1 - start_code) chr
 
-let parse_char_list name chars =
-  let char_parser c = Parser.exact (String.init 1 (Fun.const c)) in
-  let parsers = List.map (fun c -> lazy (char_parser c)) chars in
-  Parser.one_of name parsers
+let char_choice chars =
+  Parser.choice_all @@ List.map Parser.exactly chars
 
-let parse_digit =
-  parse_char_list "digit" (ascii_range '0' '9')
+let chars_to_string chars =
+  String.of_seq @@ List.to_seq chars
 
-(*
-let parse_alpha =
-  let alphabet = List.init 26 (fun x -> Char.chr (x + (Char.code 'a'))) in
-  let char_parser c = Parser.exact (String.init 1 (fun _ -> c)) in
-  let alpha_parsers = List.map (fun c -> lazy (char_parser c)) alphabet in
-  Parser.one_of "alphabetical" alpha_parsers
-*)
+let digit_parser =
+  char_choice @@ ascii_range '0' '9'
 
-let parse_int =
-  let parse_int_aux = Parser.repeating parse_digit in
-  let convert_int ds = Astnode.Integer (int_of_string (String.concat "" ds)) in
-  let parser = Parser.map convert_int parse_int_aux in
-  Parser.rename "integer" parser
-
-let parse_symbol =
-  let symbolic =
-    let printable = ascii_range '!' '~' in
-    let non_symbolic = CharSet.of_seq (String.to_seq "()[]{}") in
+let symbol_parser =
+  let printable = ascii_range '!' '~' in
+  let non_symbolic = CharSet.of_seq (String.to_seq "()[]{}") in
+  let symbols =
     List.filter (fun c -> not @@ CharSet.mem c non_symbolic) printable
   in
-  let parser = Parser.repeating (parse_char_list "symbolic" symbolic) in
-  parser
-  |> Parser.map (fun xs -> Astnode.Symbol (String.concat "" xs))
-  |> Parser.rename "symbol"
+  char_choice symbols
+  |> Parser.at_least 1
+  |> Parser.map chars_to_string
+  |> Parser.map (fun s -> Astnode.Symbol s)
 
-let parse_group parse_expr =
-  let left = Parser.exact "(" in
-  let right = Parser.(spaces *> exact ")") in
-  let expr = Parser.(spaces *> parse_expr) in
-  let group_parser = Parser.(rename "group" (left *> many expr <* right)) in
-  Parser.map (fun x -> Astnode.Group x) group_parser
+let int_parser =
+  Parser.at_least 1 digit_parser
+  |> Parser.map chars_to_string
+  |> Parser.map int_of_string
+  |> Parser.map (fun n -> Astnode.Integer n)
 
-(* TODO figure out why the fuck I have to jump through so many hoops to
-   get this thing to work *)
-let rec parse_expr_aux () =
-  let parsers = [
-    lazy parse_int;
-    lazy parse_symbol;
-    lazy (parse_group (parse_expr_aux ()));
-  ] in
-  Parser.one_of "expression" parsers
+let spaces =
+  char_choice [' '; '\n'; '\r'; '\t']
+  |> Parser.many
+  |> Parser.map chars_to_string
 
-let parse_expr = parse_expr_aux ()
+let rec group_parser seq =
+  let elem = Parser.chainr spaces expr_parser in
+  let parser =
+    Parser.(exactly '(' *> (many elem) <* spaces <* exactly ')')
+    |> Parser.map (fun grp -> Astnode.Group grp)
+  in
+  parser seq
+
+and expr_parser seq =
+  let parser =
+    Parser.choice_all [int_parser; symbol_parser; group_parser]
+  in
+  parser seq
 
 let parse (program: string): (Astnode.t list, Parser.error) result =
-  let program_parser = Parser.(many (spaces *> parse_expr)) in
-  let result = Parser.parse program_parser program in
+  let program_parser = Parser.(many (spaces *> expr_parser)) in
+  let result = Parser.parse (String.to_seq program) program_parser in
   result
 
 (* compilation cycle ======================================================== *)
@@ -72,7 +71,7 @@ let compile filename target =
   Printf.printf "compiling file %s to %s\n" filename target;
   let program = Util.read_file filename in
   match parse program with
-  | Error ({msg; pos}) -> Printf.eprintf "error at %d: %s\n" pos msg
+  | Error ({msg; _}) -> Printf.eprintf "error: %s\n" msg
   | Ok (nodes) ->
     Printf.printf
       "successfully parsed ast:\n%s\n"

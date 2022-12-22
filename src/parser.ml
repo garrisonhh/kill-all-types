@@ -1,190 +1,146 @@
-module Stream = struct
-  type t = {
-    str: string;
-    pos: int;
-    len: int;
-  }
+(** a monadic parser combinator lib *)
 
-  let eof = char_of_int 0
+module type Token =
+  sig
+    type t
+    val equal: t -> t -> bool
+    val to_string: t -> string
+  end
 
-  let from (str: string): t =
-    { str; pos = 0; len = String.length str; }
+module Make (Tok: Token) =
+  struct
+    type error = {
+      token: Tok.t option; (* None represents end of stream *)
+      msg: string;
+    }
 
-  (** returns next character, or eof at end of stream *)
-  let peek (strm: t): char =
-    if strm.pos = strm.len then eof else String.get strm.str strm.pos
+    type tok_seq = Tok.t Seq.t
 
-  (** returns next n characters, or as many as possible up to n *)
-  let npeek (n: int) (strm: t): string =
-    let len = min n (strm.len - strm.pos) in
-    String.sub strm.str strm.pos len
+    type 'out parse_result =
+      ('out * tok_seq, error) result
 
-  (** moves the stream up n characters *)
-  let ndrop (n: int) (strm: t): t =
-    { strm with pos = min strm.len (strm.pos + n) }
+    type 'out t =
+      tok_seq -> 'out parse_result
 
-  (** moves the stream 1 character *)
-  let drop (strm: t): t =
-    ndrop 1 strm
+    let make_error token msg: error =
+      { token; msg }
 
-(*
-  let next (strm: t): t * char =
-    drop strm, peek strm
+    (* combinators *)
 
-  let nnext (n: int) (strm: t): t * string =
-    ndrop n strm, npeek n strm
-*)
-end
+    let wrap (f: tok_seq -> 'out * tok_seq): 'out t =
+      fun seq -> Ok (f seq)
 
-type error = {
-  msg: string;
-  pos: int;
-}
+    let map (f: 'a -> 'b) (p: 'a t): 'b t =
+      fun seq ->
+        match p seq with
+        | Error (e) -> Error e
+        | Ok (out, seq') -> Ok (f out, seq')
 
-type 'a parser_result =
-  (Stream.t * 'a, error) result
+    let map_error (f: error -> error) (p: 'a t): 'a t =
+      fun seq ->
+        match p seq with
+        | Ok (x, seq') -> Ok(x, seq')
+        | Error (e) -> Error (f e)
 
-type 'a parser = {
-  name: string;
-  run: Stream.t -> 'a parser_result;
-}
+    let bind (f: 'a -> ('b, error) result) (p: 'a t): 'b t =
+      fun seq ->
+        match p seq with
+        | Error (e) -> Error e
+        | Ok (out, seq') ->
+          match f out with
+          | Error (e) -> Error e
+          | Ok (out') -> Ok (out', seq')
 
-(** the canonical full parse cycle *)
-let parse (p: 'a parser) (s: string): ('a, error) result =
-  match p.run (Stream.from s) with
-  | Ok (_, value) -> Ok (value)
-  | Error (e) -> Error (e)
+    (* any number of things that match p *)
+    let many (p: 'a t): 'a list t =
+      let rec collect xs seq =
+        match p seq with
+        | Error (_) -> Ok (List.rev xs, seq)
+        | Ok (x, seq') -> collect (x :: xs) seq'
+      in
+      collect []
 
-let make name run: 'a parser =
-  { name; run }
+    (* same as many, but expects some number of elements *)
+    let at_least (n: int) (p: 'a t): 'a list t =
+      let aux xs =
+        let len = List.length xs in
+        if len >= n then
+          Ok (xs)
+        else
+          let msg =
+            Printf.sprintf "expected at least %d elements here, found %d" n len
+          in
+          Error (make_error (List.nth_opt xs 0) msg)
+      in
+      bind aux @@ many p
 
-let fail (msg: string) (strm: Stream.t): 'a parser_result =
-  Error ({ msg; pos = strm.pos })
+    let chain_all (parsers: 'a t list): 'a list t =
+      let rec aux xs parsers seq =
+        match parsers with
+        | [] -> Ok (List.rev xs, seq)
+        | p :: parsers' ->
+          match p seq with
+          | Ok (x, seq') -> aux (x :: xs) parsers' seq'
+          | Error (e) -> Error e
+      in
+      aux [] parsers
 
-let map (f: 'a -> 'b) (p: 'a parser): 'b parser =
-  let run' strm = Result.map (fun (strm, x) -> (strm, f x)) (p.run strm) in
-  make p.name run'
+    let chain (leftp: 'a t) (rightp: 'b t): ('a * 'b) t =
+      fun seq ->
+        match leftp seq with
+        | Error (e) -> Error e
+        | Ok (outl, seq') ->
+          match rightp seq' with
+          | Ok (outr, seq'') -> Ok ((outl, outr), seq'')
+          | Error (e) -> Error e
 
-let map_error (f: error -> error) (p: 'a parser): 'a parser =
-  let run' strm = Result.map_error f (p.run strm) in
-  make p.name run'
+    let chainl leftp rightp =
+      map fst @@ chain leftp rightp
 
-let rename (name: string) (p: 'a parser): 'a parser =
-  map_error (fun e -> {e with msg = "expected " ^ name}) {p with name}
+    let chainr leftp rightp =
+      map snd @@ chain leftp rightp
 
-let bind (f: 'a -> 'b parser) (p: 'a parser): 'b parser =
-  let run' = fun strm ->
-    match p.run strm with
-    | Ok (strm', data) -> (f data).run strm'
-    | Error (e) -> Error (e)
-  in
-  make p.name run'
+    let choice_all (parsers: 'a t list): 'a t =
+      let rec aux parsers seq =
+        match parsers with
+        | [] -> Error (make_error None "syntax error") (* TODO better error here *)
+        | p :: parsers' ->
+          match p seq with
+          | Ok (out, seq') -> Ok (out, seq')
+          | Error (_) -> aux parsers' seq
+      in
+      aux parsers
 
-(** chain parsers; discarding first result *)
-let ( *> ) (p1: 'a parser) (p2: 'b parser): 'b parser =
-  let run strm =
-    match p1.run strm with
-    | Ok (strm', _) -> p2.run strm'
-    | Error (e) -> Error (e)
-  in
-  let name =
-    (* this shouldn't ever be used afaik, just for debugging *)
-    Printf.sprintf "(%s *> %s)" p1.name p2.name
-  in
-  make name run
+    let choice (leftp: 'a t) (rightp: 'a t): 'a t =
+      choice_all [leftp; rightp]
 
-(** chain parsers; parsing both results *)
-let ( <*> ) (p1: 'a parser) (p2: 'b parser): ('a * 'b) parser =
-  let run strm =
-    match p1.run strm with
-    | Error (e) -> Error (e)
-    | Ok (strm', a) ->
-      match p2.run strm' with
-      | Error (e) -> Error (e)
-      | Ok (strm'', b) -> Ok (strm'', (a, b))
-  in
-  let name =
-    (* this shouldn't ever be used afaik, just for debugging *)
-    Printf.sprintf "(%s *> %s)" p1.name p2.name
-  in
-  make name run
+    let ( >>= ) = Fun.flip bind
+    let ( <*> ) = chain
+    let ( <* ) = chainl
+    let ( *> ) = chainr
+    let ( <|> ) = choice
 
-(** chain but discard second result *)
-let ( <* ) p1 p2 =
-  let run strm =
-    match p1.run strm with
-    | Ok (strm', data) -> (map (fun _ -> data) p2).run strm'
-    | Error (e) -> Error (e)
-  in
-  let name =
-    (* this shouldn't ever be used afaik, just for debugging *)
-    Printf.sprintf "(%s <* %s)" p1.name p2.name
-  in
-  make name run
+    (* useful generic parsers *)
 
-(** parse as many of a thing as possible *)
-let many (p: 'a parser): 'a list parser =
-  let rec get_many arr strm: 'a list parser_result =
-    match p.run strm with
-    | Error (_) -> Ok (strm, Array.to_list arr)
-    | Ok (strm', data) ->
-      get_many (Array.append arr [|data|]) strm'
-  in
-  make ("many of " ^ p.name) (get_many [||])
+    let any: Tok.t t =
+      fun seq ->
+        let maybe = Seq.uncons seq in
+        let err = make_error None "unexpectedly reached end of file" in
+        Option.to_result ~none:err maybe
 
-(** match a string *)
-let exact (s: string): string parser =
-  let len = String.length s in
-  let run = fun strm ->
-    if s = Stream.npeek len strm then
-      let strm' = Stream.ndrop len strm in
-      Ok (strm', s)
-    else
-      let msg = Printf.sprintf "expected '%s'" s in
-      fail msg strm
-  in
-  make s run
+    let exactly tok: Tok.t t =
+      let err_msg = Printf.sprintf "expected %s" @@ Tok.to_string tok in
+      let expect_tok found =
+        if Tok.equal tok found then
+          Ok (tok)
+        else
+          Error (make_error (Some found) err_msg)
+      in
+      any >>= expect_tok
 
-let spaces: string parser =
-  let run strm =
-    let rec get_spaces spaces strm =
-      let c = Stream.peek strm in
-      match c with
-      | ' ' | '\n' | '\t' | '\r' -> get_spaces "" (Stream.drop strm)
-      | _ -> Ok (strm, "")
-    in
-    get_spaces "" strm
-  in
-  make "spaces" run
-
-let one_of (name: string) (parsers: 'a parser lazy_t list): 'a parser =
-  assert ((List.length parsers) > 0);
-  let rec first_choice parsers strm: 'a parser_result =
-    match parsers with
-    | [] -> fail ("expected " ^ name) strm
-    | p :: parsers' ->
-      match (Lazy.force p).run strm with
-      | Ok (strm', data) ->
-        Ok (strm', data)
-      | _ -> first_choice parsers' strm
-  in
-  make name (first_choice parsers)
-
-let series_of (name: string) (parsers: 'a parser lazy_t list): 'a list parser =
-  assert ((List.length parsers) > 0);
-  let rec parse_all arr parsers strm: 'a list parser_result =
-    match parsers with
-    | [] -> Ok (strm, Array.to_list arr)
-    | p :: parsers' ->
-      match (Lazy.force p).run strm with
-      | Ok (strm', data) ->
-        let arr' = Array.append arr [|data|] in
-        parse_all arr' parsers' strm'
-      | Error (e) -> Error (e)
-  in
-  make name (parse_all [||] parsers)
-
-(** parse at least one of a thing *)
-let repeating (p: 'a parser): 'a list parser =
-  let parser = map (fun (x, xs) -> x :: xs) (p <*> many p) in
-  rename ("at least one of " ^ p.name) parser
+    (** pipeline for parser from start to finish *)
+    let parse (seq: tok_seq) (p: 'out t): ('out, error) result =
+      match p seq with
+      | Ok (out, _) -> Ok out
+      | Error (e) -> Error e
+  end
