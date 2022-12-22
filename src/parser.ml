@@ -42,6 +42,10 @@ module Make (Tok: Token) =
         | Ok (x, seq') -> Ok(x, seq')
         | Error (e) -> Error (f e)
 
+    let rename (name: string) (p: 'a t): 'a t =
+      let err_msg = Printf.sprintf "expected %s" name in
+      map_error (fun e -> {e with msg = err_msg}) p
+
     let bind (f: 'a -> ('b, error) result) (p: 'a t): 'b t =
       fun seq ->
         match p seq with
@@ -67,9 +71,7 @@ module Make (Tok: Token) =
         if len >= n then
           Ok (xs)
         else
-          let msg =
-            Printf.sprintf "expected at least %d elements here, found %d" n len
-          in
+          let msg = Printf.sprintf "expected %d elements, found %d" n len in
           Error (make_error (List.nth_opt xs 0) msg)
       in
       bind aux @@ many p
@@ -103,7 +105,10 @@ module Make (Tok: Token) =
     let choice_all (parsers: 'a t list): 'a t =
       let rec aux parsers seq =
         match parsers with
-        | [] -> Error (make_error None "syntax error") (* TODO better error here *)
+        | [] ->
+          (* this is a terrible error message, but you can augment it with
+             rename and positionally aware tokens *)
+          Error (make_error None "syntax error")
         | p :: parsers' ->
           match p seq with
           | Ok (out, seq') -> Ok (out, seq')
